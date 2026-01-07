@@ -76,12 +76,16 @@ def _jit_compile(func, jax=True, tensorflow=True, **kwargs):
         if jax_mod is None: raise ImportError("JAX not installed.")
         return jax_mod.jit(func, **kwargs)
     elif backend == "torch":
-        # PyTorch 训练时的关键修改：
-        # 使用 torch.compile 进行加速（PyTorch 2.0+），或者直接返回原函数
+        # 新增：PyTorch Compile 支持
         if torch_mod and hasattr(torch_mod, "compile"):
-            # 注意：有些动态图操作可能不支持 compile，如果报错可改为直接返回 func
-            # return torch_mod.compile(func) 
-            return func 
+            # 获取用户可能传入的 fullgraph 参数，默认为 False 以提高兼容性
+            fullgraph = kwargs.get("fullgraph", False)
+            try:
+                # 使用 inductor 后端是目前的通用最佳实践
+                return torch_mod.compile(func, backend="inductor", fullgraph=fullgraph)
+            except Exception as e:
+                log.warning(f"torch.compile failed for {func.__name__}: {e}. Running in eager mode.")
+                return func
         return func
     else:
         return func
