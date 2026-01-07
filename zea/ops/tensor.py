@@ -262,7 +262,12 @@ class Pad(Operation, DataLayer):
                 f"to the input shape {shape_array}."
             )
 
-        return self.backend.numpy.pad(z, paddings, **kwargs)
+        mode = kwargs.pop("mode", "constant") 
+        if "constant_values" in kwargs:
+             constant_values = kwargs.pop("constant_values")
+             return ops.pad(z, paddings, mode=mode, constant_values=constant_values)
+        
+        return ops.pad(z, paddings, mode=mode)
 
     def call(self, **kwargs):
         data = kwargs[self.key]
