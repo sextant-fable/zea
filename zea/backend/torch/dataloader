@@ -1,78 +1,174 @@
+"""PyTorch DataLoader implementation compatible with zea configuration."""
+
 import torch
-from torch.utils.data import IterableDataset, DataLoader
 import numpy as np
+from torch.utils.data import IterableDataset, DataLoader, get_worker_info
 from zea.data.dataloader import H5Generator
+# 这里的 Resizer 和 translate 需要确保 zea.data.layers 和 zea.func.tensor 能在 torch 下运行
+# 或者我们这里手动实现简单的 numpy 版本以避免依赖复杂性
+from zea.func.tensor import translate
 
 class ZeaTorchDataset(IterableDataset):
-    def __init__(self, h5_generator):
-        self.h5_gen = h5_generator
+    def __init__(
+        self,
+        file_paths,
+        key,
+        n_frames=1,
+        return_filename=False,
+        resize_shape=None, # (H, W)
+        add_channel_dim=True,
+        normalization_range=None,
+        image_range=None,
+        generator_kwargs=None,
+    ):
+        self.file_paths = file_paths
+        self.key = key
+        self.n_frames = n_frames
+        self.return_filename = return_filename
+        self.resize_shape = resize_shape
+        self.add_channel_dim = add_channel_dim
+        self.normalization_range = normalization_range
+        self.image_range = image_range
+        self.generator_kwargs = generator_kwargs or {}
+
+    def _process_item(self, item):
+        # H5Generator 可能返回 (data, filename) 或 data
+        if self.return_filename:
+            data, filename = item
+        else:
+            data = item
+            filename = None
+
+        # 1. Add channel dim: (..., H, W) -> (..., H, W, 1)
+        # Keras 默认为 channels_last
+        if self.add_channel_dim and data.ndim == 2:
+            data = data[..., None]
+        elif self.add_channel_dim and data.ndim == 3 and self.n_frames > 1:
+            # 如果是多帧 (Frames, H, W)，增加 channel 维变成 (Frames, H, W, 1)
+            data = data[..., None]
+
+        # 2. Resize (使用 PyTorch 算子，需先转 Tensor)
+        data_tensor = torch.from_numpy(data)
+        
+        # 调整维度顺序以适应 torch.interpolate: (N, C, H, W) 或 (C, H, W)
+        # 假设 data 是 (H, W, C) 或 (Frames, H, W, C)
+        # 这里为了简单，我们假设主要处理 2D 图像 (H, W, C) -> (C, H, W) 进行 resize
+        if self.resize_shape:
+            # 这是一个简化的 resize 实现，需根据实际数据维度调整
+            # 建议：如果 zea.data.layers.Resizer 兼容 numpy，最好直接在 numpy 层面做
+            import torch.nn.functional as F
+            # 临时转为 (..., C, H, W)
+            is_batch = data_tensor.ndim == 4
+            if not is_batch: data_tensor = data_tensor.unsqueeze(0) # (1, H, W, C)
+            
+            # Permute to (N, C, H, W) for pytorch interpolation
+            data_tensor = data_tensor.permute(0, 3, 1, 2) 
+            
+            data_tensor = F.interpolate(
+                data_tensor, 
+                size=self.resize_shape, 
+                mode='bilinear', 
+                align_corners=False
+            )
+            
+            # Permute back to (N, H, W, C)
+            data_tensor = data_tensor.permute(0, 2, 3, 1)
+            if not is_batch: data_tensor = data_tensor.squeeze(0)
+
+        # 3. Normalize
+        if self.normalization_range is not None and self.image_range is not None:
+             # 手动实现简单的线性映射，避免调用可能有 backend 依赖的 zea.func
+             min_in, max_in = self.image_range
+             min_out, max_out = self.normalization_range
+             
+             data_tensor = data_tensor.float()
+             # Scale to 0-1
+             data_tensor = (data_tensor - min_in) / (max_in - min_in)
+             # Scale to out range
+             data_tensor = data_tensor * (max_out - min_out) + min_out
+
+        if self.return_filename:
+            return data_tensor, filename
+        return data_tensor
 
     def __iter__(self):
-        """
-        返回数据迭代器。
-        注意：对于多进程加载 (num_workers > 0)，需要处理数据分片，
-        防止每个 worker 返回相同的数据。
-        """
-        worker_info = torch.utils.data.get_worker_info()
-        if worker_info is None:
-            # 单进程模式，直接返回
-            return self.h5_gen.iterator()
-        else:
-            # 多进程模式：简单的分片策略
-            # 注意：这依赖于 H5Generator 在迭代时是否重新打开文件句柄
-            # 为了安全起见，建议训练时先尝试 num_workers=0
-            # 如果 H5Generator 支持分片，这里需要传入 worker_id
-            # 目前为了稳定性，建议仅在主进程读取
-            return self.h5_gen.iterator()
+        # 关键：在 iter 里初始化 H5Generator，确保多进程安全
+        worker_info = get_worker_info()
+        
+        # 处理分片逻辑 (Sharding)
+        # 如果 H5Generator 支持 shard_index，应该在这里计算
+        # 为了简单，这里通过 generator_kwargs 传递，或者如果 H5Generator 不支持分片，
+        # 多 worker 会导致数据重复。
+        # 建议在 H5Generator 层面通过 split file_paths 来实现分片。
+        
+        local_file_paths = self.file_paths
+        if worker_info is not None:
+            # 简单的文件级分片
+            num_workers = worker_info.num_workers
+            worker_id = worker_info.id
+            # 将文件列表按 worker 切分
+            local_file_paths = np.array_split(self.file_paths, num_workers)[worker_id].tolist()
+
+        if not local_file_paths:
+            return
+
+        generator = H5Generator(
+            file_paths=local_file_paths,
+            key=self.key,
+            n_frames=self.n_frames,
+            return_filename=self.return_filename,
+            **self.generator_kwargs
+        )
+
+        for item in generator.iterator():
+            yield self._process_item(item)
+
 
 def make_dataloader(
     file_paths,
     batch_size,
-    shuffle=True,
-    seed=None,
-    keys=None,
+    key="data/image",
     n_frames=1,
-    num_workers=0,  # PyTorch 特有参数
-    pin_memory=True, # PyTorch 特有参数
+    shuffle=True,
+    return_filename=False,
+    resize_type=None,
+    image_size=None, # Tuple (H, W)
+    image_range=None,
+    normalization_range=None,
+    num_workers=0,
+    prefetch_factor=2, # PyTorch default
     **kwargs
 ):
     """
-    创建一个 PyTorch DataLoader，模拟原有的 TensorFlow 接口。
+    Creates a PyTorch DataLoader compatible with Zea's pipeline.
     """
-    # 1. 实例化底层的 Numpy 生成器 (复用 zea 原有逻辑)
-    # 注意：H5Generator 不需要 backend 依赖，它是纯 Numpy 的
-    generator = H5Generator(
+    
+    # 构造 Dataset
+    dataset = ZeaTorchDataset(
         file_paths=file_paths,
-        batch_size=batch_size, # H5Generator 内部处理 batch 组装
-        shuffle=shuffle,
-        seed=seed,
-        keys=keys,
+        key=key,
         n_frames=n_frames,
-        **kwargs
+        return_filename=return_filename,
+        resize_shape=image_size,
+        normalization_range=normalization_range,
+        image_range=image_range,
+        generator_kwargs={
+            "shuffle": shuffle,
+            "sort_files": kwargs.get("sort_files", True),
+            # 传递其他 kwargs 给 H5Generator
+            **kwargs 
+        }
     )
 
-    # 2. 包装成 PyTorch Dataset
-    # 注意：H5Generator 已经输出了 batch，所以 DataLoader 的 batch_size 设为 None
-    # 这样 DataLoader 就不会再次尝试且分 batch，而是直接传递 generator 产出的 numpy array
-    dataset = ZeaTorchDataset(generator)
-
-    # 3. 定义 collate_fn 将 Numpy 转为 Tensor
-    def numpy_collate(batch):
-        # batch 是从 generator 出来的一个样本（其实已经是一个 batch 了）
-        # 转换所有 numpy 数组为 torch tensor
-        if isinstance(batch, (list, tuple)):
-            return [torch.from_numpy(x) if isinstance(x, np.ndarray) else x for x in batch]
-        elif isinstance(batch, dict):
-            return {k: torch.from_numpy(v) if isinstance(v, np.ndarray) else v for k, v in batch.items()}
-        return torch.from_numpy(batch) if isinstance(batch, np.ndarray) else batch
-
-    # 4. 创建 PyTorch DataLoader
-    loader = DataLoader(
+    # 构造 DataLoader
+    # batch_size 不为 None，让 DataLoader 负责堆叠 (Stacking)
+    dataloader = DataLoader(
         dataset,
-        batch_size=None, # 禁用自动 batching，因为 H5Generator 已经做好了
+        batch_size=batch_size,
         num_workers=num_workers,
-        pin_memory=pin_memory,
-        collate_fn=numpy_collate
+        pin_memory=True if torch.cuda.is_available() else False,
+        prefetch_factor=prefetch_factor if num_workers > 0 else None,
+        # collate_fn 默认会将 list of tensors 堆叠成 batch tensor，符合预期
     )
 
-    return loader
+    return dataloader
