@@ -1,0 +1,78 @@
+import torch
+from torch.utils.data import IterableDataset, DataLoader
+import numpy as np
+from zea.data.dataloader import H5Generator
+
+class ZeaTorchDataset(IterableDataset):
+    def __init__(self, h5_generator):
+        self.h5_gen = h5_generator
+
+    def __iter__(self):
+        """
+        返回数据迭代器。
+        注意：对于多进程加载 (num_workers > 0)，需要处理数据分片，
+        防止每个 worker 返回相同的数据。
+        """
+        worker_info = torch.utils.data.get_worker_info()
+        if worker_info is None:
+            # 单进程模式，直接返回
+            return self.h5_gen.iterator()
+        else:
+            # 多进程模式：简单的分片策略
+            # 注意：这依赖于 H5Generator 在迭代时是否重新打开文件句柄
+            # 为了安全起见，建议训练时先尝试 num_workers=0
+            # 如果 H5Generator 支持分片，这里需要传入 worker_id
+            # 目前为了稳定性，建议仅在主进程读取
+            return self.h5_gen.iterator()
+
+def make_dataloader(
+    file_paths,
+    batch_size,
+    shuffle=True,
+    seed=None,
+    keys=None,
+    n_frames=1,
+    num_workers=0,  # PyTorch 特有参数
+    pin_memory=True, # PyTorch 特有参数
+    **kwargs
+):
+    """
+    创建一个 PyTorch DataLoader，模拟原有的 TensorFlow 接口。
+    """
+    # 1. 实例化底层的 Numpy 生成器 (复用 zea 原有逻辑)
+    # 注意：H5Generator 不需要 backend 依赖，它是纯 Numpy 的
+    generator = H5Generator(
+        file_paths=file_paths,
+        batch_size=batch_size, # H5Generator 内部处理 batch 组装
+        shuffle=shuffle,
+        seed=seed,
+        keys=keys,
+        n_frames=n_frames,
+        **kwargs
+    )
+
+    # 2. 包装成 PyTorch Dataset
+    # 注意：H5Generator 已经输出了 batch，所以 DataLoader 的 batch_size 设为 None
+    # 这样 DataLoader 就不会再次尝试且分 batch，而是直接传递 generator 产出的 numpy array
+    dataset = ZeaTorchDataset(generator)
+
+    # 3. 定义 collate_fn 将 Numpy 转为 Tensor
+    def numpy_collate(batch):
+        # batch 是从 generator 出来的一个样本（其实已经是一个 batch 了）
+        # 转换所有 numpy 数组为 torch tensor
+        if isinstance(batch, (list, tuple)):
+            return [torch.from_numpy(x) if isinstance(x, np.ndarray) else x for x in batch]
+        elif isinstance(batch, dict):
+            return {k: torch.from_numpy(v) if isinstance(v, np.ndarray) else v for k, v in batch.items()}
+        return torch.from_numpy(batch) if isinstance(batch, np.ndarray) else batch
+
+    # 4. 创建 PyTorch DataLoader
+    loader = DataLoader(
+        dataset,
+        batch_size=None, # 禁用自动 batching，因为 H5Generator 已经做好了
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        collate_fn=numpy_collate
+    )
+
+    return loader
